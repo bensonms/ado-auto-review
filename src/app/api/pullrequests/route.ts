@@ -3,7 +3,7 @@ import { getLatestPullRequests } from '@/utils/adoClient';
 
 export async function GET() {
   try {
-    const pullRequests = await getLatestPullRequests(5);
+    const pullRequests = await getLatestPullRequests();
     return NextResponse.json(pullRequests);
   } catch (error) {
     console.error('Error in pull requests API:', error);
