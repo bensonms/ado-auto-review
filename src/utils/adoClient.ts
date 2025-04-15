@@ -1,3 +1,5 @@
+'use server';
+
 import * as azdev from 'azure-devops-node-api';
 import { PullRequestStatus } from 'azure-devops-node-api/interfaces/GitInterfaces';
 
@@ -12,6 +14,7 @@ export interface PullRequestDetails {
   sourceRef: string;
   targetRef: string;
   url: string;
+  isAuthenticatedUserPR: boolean;
 }
 
 export interface CodeReviewResult {
@@ -69,9 +72,9 @@ export async function getAdoClient() {
   }
 }
 
-export async function getLatestPullRequests(): Promise<PullRequestDetails | null> {
+export async function getLatestPullRequests(specificPrId?: number): Promise<PullRequestDetails | null> {
   try {
-    console.debug('Fetching latest pull request');
+    console.debug('Fetching pull request', { specificPrId });
 
     const { client, userId } = await getAdoClient();
     const gitApi = await client.getGitApi();
@@ -102,11 +105,13 @@ export async function getLatestPullRequests(): Promise<PullRequestDetails | null
     }
 
     // Now try to get pull requests with different statuses to debug
-    const searchCriteria = {
-      status: PullRequestStatus.Active,
-      repositoryId: repositoryId,
-      creatorId: userId
-    };
+    const searchCriteria = specificPrId
+      ? { pullRequestId: specificPrId }
+      : {
+          status: PullRequestStatus.Active,
+          repositoryId: repositoryId,
+          creatorId: userId
+        };
 
     console.debug('Fetching pull requests with criteria:', {
       ...searchCriteria,
@@ -124,52 +129,24 @@ export async function getLatestPullRequests(): Promise<PullRequestDetails | null
     console.debug('Raw pull requests response:', pullRequests);
 
     if (!pullRequests || pullRequests.length === 0) {
-      console.debug('No pull requests found. Trying without creator filter...');
-      // Try without creator filter as a test
-      const unfilteredPRs = await gitApi.getPullRequests(
-        repositoryId,
-        {
-          status: PullRequestStatus.All,
-          repositoryId: repositoryId
-        },
-        project
-      );
-      console.debug('Unfiltered pull requests count:', unfilteredPRs?.length || 0);
-      if (unfilteredPRs?.length > 0) {
-        console.debug('Available creators:', unfilteredPRs.map(pr => ({
-          id: pr.createdBy?.id,
-          name: pr.createdBy?.displayName
-        })));
-      }
+      console.debug('No pull requests found');
+      return null;
     }
 
-    // console.debug('Retrieved pull requests:', {
-    //   count: pullRequests.length,
-    //   requests: pullRequests.map(pr => ({
-    //     id: pr.pullRequestId,
-    //     title: pr.title,
-    //     status: pr.status,
-    //     createdBy: pr.createdBy?.displayName,
-    //     creatorId: pr.createdBy?.id,
-    //     sourceRef: pr.sourceRefName,
-    //     targetRef: pr.targetRefName
-    //   }))
-    // });
-
-    return pullRequests.length > 0
-      ? {
-          pullRequestId: pullRequests[0].pullRequestId || 0,
-          title: pullRequests[0].title || 'Untitled Pull Request',
-          description: pullRequests[0].description || '',
-          status: pullRequests[0].status || PullRequestStatus.NotSet,
-          createdBy: pullRequests[0].createdBy?.displayName || 'Unknown',
-          creationDate: new Date(pullRequests[0].creationDate || Date.now()),
-          repository: pullRequests[0].repository?.name || 'Unknown',
-          sourceRef: pullRequests[0].sourceRefName || '',
-          targetRef: pullRequests[0].targetRefName || '',
-          url: pullRequests[0]._links?.web?.href || '',
-        }
-      : null;
+    const pr = pullRequests[0];
+    return {
+      pullRequestId: pr.pullRequestId || 0,
+      title: pr.title || 'Untitled Pull Request',
+      description: pr.description || '',
+      status: pr.status || PullRequestStatus.NotSet,
+      createdBy: pr.createdBy?.displayName || 'Unknown',
+      creationDate: new Date(pr.creationDate || Date.now()),
+      repository: pr.repository?.name || 'Unknown',
+      sourceRef: pr.sourceRefName || '',
+      targetRef: pr.targetRefName || '',
+      url: pr._links?.web?.href || '',
+      isAuthenticatedUserPR: pr.createdBy?.id === userId
+    };
   } catch (error) {
     console.error('Error in getLatestPullRequests:', error);
     if (error instanceof Error) {
