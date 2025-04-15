@@ -59,19 +59,49 @@ export async function getLatestPullRequests(count: number = 5): Promise<PullRequ
       throw new Error('ADO Project is not configured');
     }
 
-    console.debug('Fetching pull requests for repository:', repositoryId);
+    // Let's try to get the repository first to verify access
+    try {
+      const repo = await gitApi.getRepository(repositoryId, project);
+      console.debug('Successfully accessed repository:', {
+        id: repo.id,
+        name: repo.name,
+        project: repo.project?.name,
+        defaultBranch: repo.defaultBranch
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error accessing repository';
+      console.error('Error accessing repository:', error);
+      throw new Error(`Cannot access repository. Check permissions and repository ID. Details: ${errorMessage}`);
+    }
+
+    // Now try to get pull requests with different statuses to debug
+    const searchCriteria = {
+      status: PullRequestStatus.All,
+      repositoryId: repositoryId,
+    };
+
+    console.debug('Fetching pull requests with criteria:', searchCriteria);
 
     const pullRequests = await gitApi.getPullRequests(
       repositoryId,
-      {
-        status: PullRequestStatus.All,
-        targetRefName: 'refs/heads/main',
-        repositoryId: repositoryId,
-      },
+      searchCriteria,
       project,
       count,
       0
     );
+
+    console.debug('Raw pull requests response:', pullRequests);
+
+    if (!pullRequests || pullRequests.length === 0) {
+      console.debug('No pull requests found. Trying without filters...');
+      // Try without any filters as a test
+      const unfilteredPRs = await gitApi.getPullRequests(
+        repositoryId,
+        {},
+        project
+      );
+      console.debug('Unfiltered pull requests count:', unfilteredPRs?.length || 0);
+    }
 
     console.debug('Retrieved pull requests:', {
       count: pullRequests.length,
@@ -79,7 +109,9 @@ export async function getLatestPullRequests(count: number = 5): Promise<PullRequ
         id: pr.pullRequestId,
         title: pr.title,
         status: pr.status,
-        createdBy: pr.createdBy?.displayName
+        createdBy: pr.createdBy?.displayName,
+        sourceRef: pr.sourceRefName,
+        targetRef: pr.targetRefName
       }))
     });
 
