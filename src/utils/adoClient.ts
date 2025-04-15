@@ -36,10 +36,11 @@ export async function getAdoClient() {
     // Test the connection
     const connData = await client.connect();
     console.debug('ADO Connection successful:', {
-      user: connData.authenticatedUser?.providerDisplayName
+      user: connData.authenticatedUser?.providerDisplayName,
+      userId: connData.authenticatedUser?.id
     });
     
-    return client;
+    return { client, userId: connData.authenticatedUser?.id };
   } catch (error) {
     console.error('Error initializing ADO client:', error);
     throw error;
@@ -50,13 +51,17 @@ export async function getLatestPullRequests(count: number = 5): Promise<PullRequ
   try {
     console.debug('Fetching pull requests with count:', count);
 
-    const client = await getAdoClient();
+    const { client, userId } = await getAdoClient();
     const gitApi = await client.getGitApi();
     const project = process.env.ADO_PROJECT;
     const repositoryId = '1b255d6e-1545-42ab-9e75-1fb3f0202dfa';
 
     if (!project) {
       throw new Error('ADO Project is not configured');
+    }
+
+    if (!userId) {
+      throw new Error('Could not determine authenticated user ID');
     }
 
     // Let's try to get the repository first to verify access
@@ -78,9 +83,13 @@ export async function getLatestPullRequests(count: number = 5): Promise<PullRequ
     const searchCriteria = {
       status: PullRequestStatus.All,
       repositoryId: repositoryId,
+      creatorId: userId
     };
 
-    console.debug('Fetching pull requests with criteria:', searchCriteria);
+    console.debug('Fetching pull requests with criteria:', {
+      ...searchCriteria,
+      userId: userId
+    });
 
     const pullRequests = await gitApi.getPullRequests(
       repositoryId,
@@ -93,14 +102,23 @@ export async function getLatestPullRequests(count: number = 5): Promise<PullRequ
     console.debug('Raw pull requests response:', pullRequests);
 
     if (!pullRequests || pullRequests.length === 0) {
-      console.debug('No pull requests found. Trying without filters...');
-      // Try without any filters as a test
+      console.debug('No pull requests found. Trying without creator filter...');
+      // Try without creator filter as a test
       const unfilteredPRs = await gitApi.getPullRequests(
         repositoryId,
-        {},
+        {
+          status: PullRequestStatus.All,
+          repositoryId: repositoryId
+        },
         project
       );
       console.debug('Unfiltered pull requests count:', unfilteredPRs?.length || 0);
+      if (unfilteredPRs?.length > 0) {
+        console.debug('Available creators:', unfilteredPRs.map(pr => ({
+          id: pr.createdBy?.id,
+          name: pr.createdBy?.displayName
+        })));
+      }
     }
 
     console.debug('Retrieved pull requests:', {
@@ -110,6 +128,7 @@ export async function getLatestPullRequests(count: number = 5): Promise<PullRequ
         title: pr.title,
         status: pr.status,
         createdBy: pr.createdBy?.displayName,
+        creatorId: pr.createdBy?.id,
         sourceRef: pr.sourceRefName,
         targetRef: pr.targetRefName
       }))
