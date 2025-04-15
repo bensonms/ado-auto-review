@@ -1,7 +1,7 @@
 'use server';
 
 import * as azdev from 'azure-devops-node-api';
-import { PullRequestStatus } from 'azure-devops-node-api/interfaces/GitInterfaces';
+import { PullRequestStatus, GitPullRequest, GitItem, GitCommitRef } from 'azure-devops-node-api/interfaces/GitInterfaces';
 
 export interface PullRequestDetails {
   pullRequestId: number;
@@ -160,11 +160,11 @@ export async function getLatestPullRequests(specificPrId?: number): Promise<Pull
   }
 }
 
-export async function reviewPullRequest(pullRequestId?: number): Promise<CodeReviewResult> {
+export async function reviewPullRequest(pullRequestId: number | undefined = undefined): Promise<CodeReviewResult> {
   try {
     // If no PR ID provided, get the latest PR
     let prToReview: PullRequestDetails | null = null;
-    if (!pullRequestId) {
+    if (pullRequestId === undefined) {
       prToReview = await getLatestPullRequests();
       if (!prToReview) {
         throw new Error('No pull request found to review');
@@ -187,11 +187,19 @@ export async function reviewPullRequest(pullRequestId?: number): Promise<CodeRev
       throw new Error(`Pull request ${pullRequestId} not found`);
     }
 
-    // Get the changes in the pull request
+    // Get all iterations to analyze the complete change history
+    const iterations = await gitApi.getPullRequestIterations(repositoryId, pullRequestId, project);
+    const latestIteration = iterations[iterations.length - 1];
+    
+    if (!latestIteration || latestIteration.id === undefined) {
+      throw new Error('Could not determine the latest iteration of the pull request');
+    }
+
+    // Get the changes in the pull request for the latest iteration
     const changes = await gitApi.getPullRequestIterationChanges(
       repositoryId,
       pullRequestId,
-      1,  // Get changes from the first iteration
+      latestIteration.id,
       project
     );
 
@@ -202,7 +210,7 @@ export async function reviewPullRequest(pullRequestId?: number): Promise<CodeRev
       project
     );
 
-    // Analyze the changes
+    // Initialize statistics
     const statistics = {
       filesChanged: changes.changeEntries?.length || 0,
       additions: 0,
@@ -211,15 +219,18 @@ export async function reviewPullRequest(pullRequestId?: number): Promise<CodeRev
     };
 
     const suggestions: CodeReviewResult['suggestions'] = [];
+    const securityIssues: Set<string> = new Set();
+    const performanceIssues: Set<string> = new Set();
 
     // Analyze each changed file
     if (changes.changeEntries) {
       for (const change of changes.changeEntries) {
         const filePath = change.item?.path;
-        // Get the file content
+        
         if (filePath && change.item) {
           try {
-            const fileContent = await gitApi.getItemContent(
+            // Get both old and new versions of the file for diff analysis
+            const newContent = await gitApi.getItemContent(
               repositoryId,
               filePath,
               project,
@@ -228,83 +239,98 @@ export async function reviewPullRequest(pullRequestId?: number): Promise<CodeRev
               true
             );
 
-            // Analyze file content for potential issues
-            if (fileContent) {
-              const content = fileContent.toString();
-              if (content.includes('TODO') || content.includes('FIXME')) {
-                suggestions.push({
-                  file: filePath,
-                  message: 'Contains TODO or FIXME comments that should be addressed',
-                  severity: 'medium'
-                });
-              }
-
-              // Add file-specific suggestions
-              if (filePath.endsWith('.ts') || filePath.endsWith('.tsx')) {
-                // TypeScript specific checks
-                suggestions.push({
-                  file: filePath,
-                  message: 'Consider adding type annotations for better code maintainability',
-                  severity: 'low'
-                });
-
-                // Check for long functions
-                const functionMatches = content.match(/function\s+\w+\s*\([^)]*\)\s*{([^}]*)}/g) || [];
-                functionMatches.forEach((func: string) => {
-                  const lines = func.split('\n').length;
-                  if (lines > 30) {
-                    suggestions.push({
-                      file: filePath,
-                      message: 'Function is too long (over 30 lines). Consider breaking it down into smaller functions.',
-                      severity: 'medium'
-                    });
-                  }
-                });
-
-                // Check for console.log statements
-                if (content.match(/console\.log\(/)) {
-                  suggestions.push({
-                    file: filePath,
-                    message: 'Contains console.log statements. Consider removing them before merging.',
-                    severity: 'low'
-                  });
+            let oldContent: Buffer | undefined;
+            const previousVersion = (change.item as GitItem & { previousVersionBase?: string }).previousVersionBase;
+            if (previousVersion) {
+              try {
+                const oldContentStream = await gitApi.getItemContent(
+                  repositoryId,
+                  filePath,
+                  project,
+                  undefined,
+                  undefined,
+                  true
+                );
+                if (oldContentStream instanceof Buffer) {
+                  oldContent = oldContentStream;
+                } else if (oldContentStream instanceof Uint8Array) {
+                  oldContent = Buffer.from(oldContentStream);
                 }
-
-                // Check for magic numbers
-                const magicNumberRegex = /(?<!\/\/[^\n]*)\b\d+\b(?!\s*[x×]|\s*\.|px|em|rem|%|s|ms|deg|vh|vw)/g;
-                if (content.match(magicNumberRegex)) {
-                  suggestions.push({
-                    file: filePath,
-                    message: 'Contains magic numbers. Consider using named constants.',
-                    severity: 'low'
-                  });
-                }
-
-                // Check for commented out code
-                if (content.match(/\/\/\s*[a-zA-Z0-9]+.*\([^\n]*\)/)) {
-                  suggestions.push({
-                    file: filePath,
-                    message: 'Contains commented out code. Consider removing it.',
-                    severity: 'low'
-                  });
-                }
+              } catch (error) {
+                console.warn(`Could not fetch previous version of ${filePath}:`, error);
               }
+            }
 
-              // Check for large files
-              if (content.split('\n').length > 300) {
-                suggestions.push({
-                  file: filePath,
-                  message: 'File is too large (over 300 lines). Consider splitting it into smaller modules.',
-                  severity: 'medium'
-                });
-              }
+            if (newContent) {
+              const content = newContent.toString();
+              const oldContentStr = oldContent?.toString() || '';
 
               // Track changes
-              if (change.changeType === 2) { // Edit
-                const lineCount = content.split('\n').length;
-                statistics.additions += lineCount;
-                // We'll estimate deletions based on the change type
-                statistics.deletions += Math.floor(lineCount * 0.3);
+              const newLines = content.split('\n');
+              statistics.additions += newLines.length;
+              if (oldContent) {
+                const oldLines = oldContentStr.split('\n');
+                statistics.deletions += Math.max(0, oldLines.length - newLines.length);
+              }
+
+              // Analyze file content based on file type
+              if (filePath.endsWith('.ts') || filePath.endsWith('.tsx')) {
+                // TypeScript/JavaScript specific checks
+                
+                // 1. Code Complexity Checks
+                const complexityIssues = analyzeCodeComplexity(content);
+                suggestions.push(...complexityIssues.map(issue => ({
+                  file: filePath,
+                  ...issue
+                })));
+
+                // 2. Security Checks
+                checkSecurityIssues(content, filePath, securityIssues);
+
+                // 3. Performance Checks
+                checkPerformanceIssues(content, filePath, performanceIssues);
+
+                // 4. Code Style and Best Practices
+                const styleIssues = analyzeCodeStyle(content);
+                suggestions.push(...styleIssues.map(issue => ({
+                  file: filePath,
+                  ...issue
+                })));
+
+                // 5. React-specific checks if applicable
+                if (filePath.endsWith('.tsx')) {
+                  const reactIssues = analyzeReactCode(content);
+                  suggestions.push(...reactIssues.map(issue => ({
+                    file: filePath,
+                    ...issue
+                  })));
+                }
+
+                // 6. Diff Analysis
+                if (oldContentStr) {
+                  const diffIssues = analyzeDiff(oldContentStr, content);
+                  suggestions.push(...diffIssues.map(issue => ({
+                    file: filePath,
+                    ...issue
+                  })));
+                }
+              }
+
+              // Check for test coverage
+              if (filePath.includes('src/') && !filePath.includes('.test.') && !filePath.includes('.spec.')) {
+                const hasCorrespondingTest = changes.changeEntries.some(entry => 
+                  entry.item?.path?.includes(filePath.replace('src/', 'test/')) ||
+                  entry.item?.path?.includes(filePath.replace('.ts', '.test.ts')) ||
+                  entry.item?.path?.includes(filePath.replace('.tsx', '.test.tsx'))
+                );
+
+                if (!hasCorrespondingTest) {
+                  suggestions.push({
+                    file: filePath,
+                    message: 'No corresponding test file found for this changed file',
+                    severity: 'high'
+                  });
+                }
               }
             }
           } catch (error) {
@@ -316,43 +342,267 @@ export async function reviewPullRequest(pullRequestId?: number): Promise<CodeRev
 
     statistics.totalChanges = statistics.additions + statistics.deletions;
 
+    // Add security and performance issues to suggestions
+    securityIssues.forEach(issue => {
+      suggestions.push({
+        file: 'multiple files',
+        message: issue,
+        severity: 'high'
+      });
+    });
+
+    performanceIssues.forEach(issue => {
+      suggestions.push({
+        file: 'multiple files',
+        message: issue,
+        severity: 'medium'
+      });
+    });
+
     // Analyze commit messages
-    const hasGoodCommitMessages = commits.every(commit => 
-      commit.comment && 
-      commit.comment.length > 10 && 
-      !commit.comment.toLowerCase().includes('wip')
-    );
+    const hasGoodCommitMessages = analyzeCommitMessages(commits);
 
     // Check branch naming
     const sourceBranch = pr.sourceRefName?.replace('refs/heads/', '') || '';
-    const hasGoodBranchNaming = /^(feature|bugfix|hotfix|release)\/[a-z0-9-]+$/.test(sourceBranch);
+    const branchNamingAnalysis = analyzeBranchNaming(sourceBranch);
 
-    // Check if tests are included
-    const hasTests = changes.changeEntries?.some(change => 
-      change.item?.path?.includes('test') || 
-      change.item?.path?.includes('spec')
-    ) || false;
-
-    // Check if documentation is updated
-    const hasDocUpdates = changes.changeEntries?.some(change =>
-      change.item?.path?.includes('README') ||
-      change.item?.path?.includes('docs/') ||
-      change.item?.path?.endsWith('.md')
-    ) || false;
+    // Check documentation updates
+    const docAnalysis = analyzeDocumentation(changes.changeEntries || []);
 
     return {
-      summary: `Review of PR #${pullRequestId}: ${pr.title}`,
-      suggestions,
+      summary: generatePRSummary(pr, statistics, suggestions),
+      suggestions: suggestions.sort((a, b) => 
+        severityScore(b.severity) - severityScore(a.severity)
+      ),
       statistics,
       bestPractices: {
         commitMessages: hasGoodCommitMessages,
-        branchNaming: hasGoodBranchNaming,
-        testCoverage: hasTests,
-        documentationUpdated: hasDocUpdates
+        branchNaming: branchNamingAnalysis.isValid,
+        testCoverage: !suggestions.some(s => s.message.includes('No corresponding test')),
+        documentationUpdated: docAnalysis.hasUpdates
       }
     };
   } catch (error) {
     console.error('Error in reviewPullRequest:', error);
     throw error;
   }
+}
+
+// Helper functions for code analysis
+function analyzeCodeComplexity(content: string) {
+  const issues: Array<{ message: string; severity: 'high' | 'medium' | 'low' }> = [];
+  
+  // Check cyclomatic complexity
+  const functionMatches = content.match(/function\s+\w+\s*\([^)]*\)\s*{([^}]*)}/g) || [];
+  functionMatches.forEach((func: string) => {
+    const complexity = (func.match(/if|while|for|&&|\|\||switch|catch/g) || []).length;
+    if (complexity > 10) {
+      issues.push({
+        message: `High cyclomatic complexity (${complexity}). Consider breaking down the function.`,
+        severity: 'high'
+      });
+    }
+  });
+
+  // Check for nested callbacks/promises
+  const nestingLevel = (content.match(/\.then\(|\bcallback\(|\basync\s+/g) || []).length;
+  if (nestingLevel > 3) {
+    issues.push({
+      message: 'Deep nesting of async operations detected. Consider using async/await or breaking down the chain.',
+      severity: 'medium'
+    });
+  }
+
+  return issues;
+}
+
+function checkSecurityIssues(content: string, filePath: string, issues: Set<string>) {
+  // Check for common security issues
+  if (content.includes('eval(')) {
+    issues.add('Usage of eval() detected - potential security risk');
+  }
+
+  if (content.match(/innerHTML\s*=/)) {
+    issues.add('Direct innerHTML manipulation detected - XSS risk');
+  }
+
+  if (content.match(/process\.env\.[A-Z_]+/g)) {
+    const envVars = content.match(/process\.env\.([A-Z_]+)/g) || [];
+    envVars.forEach(envVar => {
+      if (envVar.includes('KEY') || envVar.includes('SECRET') || envVar.includes('PASSWORD')) {
+        issues.add(`Sensitive environment variable ${envVar} might be exposed`);
+      }
+    });
+  }
+}
+
+function checkPerformanceIssues(content: string, filePath: string, issues: Set<string>) {
+  // Check for performance anti-patterns
+  if (content.includes('Array.prototype') || content.includes('Object.prototype')) {
+    issues.add('Prototype modification detected - can cause performance issues');
+  }
+
+  const hasManyLoops = (content.match(/for\s*\(|while\s*\(|forEach|map|filter|reduce/g) || []).length > 5;
+  if (hasManyLoops) {
+    issues.add('Multiple nested loops or array operations detected - potential performance bottleneck');
+  }
+
+  if (content.includes('document.querySelectorAll')) {
+    issues.add('Consider using more specific selectors or caching DOM queries');
+  }
+}
+
+function analyzeCodeStyle(content: string) {
+  const issues: Array<{ message: string; severity: 'high' | 'medium' | 'low' }> = [];
+
+  // Check naming conventions
+  const badVariableNames = content.match(/\b[a-z_]{1,2}\b(?!\s*:)/g);
+  if (badVariableNames) {
+    issues.push({
+      message: 'Found variables with unclear names. Consider using more descriptive names.',
+      severity: 'medium'
+    });
+  }
+
+  // Check for consistent code style
+  if (content.includes('var ')) {
+    issues.push({
+      message: 'Use of var detected. Prefer const or let for better scoping.',
+      severity: 'medium'
+    });
+  }
+
+  return issues;
+}
+
+function analyzeReactCode(content: string) {
+  const issues: Array<{ message: string; severity: 'high' | 'medium' | 'low' }> = [];
+
+  // Check for React hooks rules
+  if (content.includes('useState') || content.includes('useEffect')) {
+    const hookCalls = content.match(/use[A-Z]\w+/g) || [];
+    if (hookCalls.some(hook => hook.match(/use\w+/))) {
+      const hasConditionalHooks = content.match(/if\s*\(.*\)\s*{[^}]*use[A-Z]\w+/);
+      if (hasConditionalHooks) {
+        issues.push({
+          message: 'Hooks should not be called inside conditions',
+          severity: 'high'
+        });
+      }
+    }
+  }
+
+  // Check for proper dependency arrays
+  const effectCalls = content.match(/useEffect\(\s*\(\)\s*=>\s*{[^}]*},\s*\[(.*?)\]/g) || [];
+  effectCalls.forEach(effect => {
+    if (effect.includes('[]')) {
+      issues.push({
+        message: 'Empty dependency array in useEffect - verify if this is intended',
+        severity: 'medium'
+      });
+    }
+  });
+
+  return issues;
+}
+
+function analyzeDiff(oldContent: string, newContent: string) {
+  const issues: Array<{ message: string; severity: 'high' | 'medium' | 'low' }> = [];
+
+  // Check for large code blocks being moved without changes
+  const oldLines = oldContent.split('\n');
+  const newLines = newContent.split('\n');
+  const movedBlocks = findMovedBlocks(oldLines, newLines);
+  
+  if (movedBlocks > 3) {
+    issues.push({
+      message: 'Large blocks of code appear to be moved. Consider extracting into shared functions/components.',
+      severity: 'medium'
+    });
+  }
+
+  return issues;
+}
+
+function findMovedBlocks(oldLines: string[], newLines: string[]): number {
+  let movedBlocks = 0;
+  const minBlockSize = 5;
+
+  for (let i = 0; i < oldLines.length - minBlockSize; i++) {
+    const block = oldLines.slice(i, i + minBlockSize).join('\n');
+    const newIndex = newLines.join('\n').indexOf(block);
+    
+    if (newIndex !== -1 && Math.abs(newIndex - i) > minBlockSize) {
+      movedBlocks++;
+      i += minBlockSize - 1;
+    }
+  }
+
+  return movedBlocks;
+}
+
+function analyzeCommitMessages(commits: GitCommitRef[]): boolean {
+  return commits.every(commit => {
+    const message = commit.comment || '';
+    // Check for conventional commit format
+    const hasConventionalFormat = /^(feat|fix|docs|style|refactor|test|chore)(\(.+\))?: .{1,50}/.test(message);
+    // Check for descriptive message
+    const isDescriptive = message.length >= 10 && !message.toLowerCase().includes('wip');
+    return hasConventionalFormat && isDescriptive;
+  });
+}
+
+function analyzeBranchNaming(branchName: string) {
+  const conventionalBranchPattern = /^(feature|bugfix|hotfix|release)\/[a-z0-9-]+$/;
+  const isValid = conventionalBranchPattern.test(branchName);
+  return {
+    isValid,
+    message: isValid ? 'Branch naming follows conventions' : 'Branch name should follow pattern: type/description'
+  };
+}
+
+interface GitChangeEntry {
+  item?: GitItem;
+  changeType?: number;
+}
+
+function analyzeDocumentation(changes: GitChangeEntry[]): { hasUpdates: boolean; message: string } {
+  const docFiles = changes.filter(change => 
+    change.item?.path?.includes('README') ||
+    change.item?.path?.includes('docs/') ||
+    change.item?.path?.endsWith('.md')
+  );
+
+  return {
+    hasUpdates: docFiles.length > 0,
+    message: docFiles.length > 0 ? 'Documentation has been updated' : 'Consider updating documentation'
+  };
+}
+
+function severityScore(severity: 'high' | 'medium' | 'low'): number {
+  return { high: 3, medium: 2, low: 1 }[severity] || 0;
+}
+
+interface AnalysisSummary {
+  pr: GitPullRequest;
+  statistics: {
+    filesChanged: number;
+    additions: number;
+    deletions: number;
+    totalChanges: number;
+  };
+  suggestions: Array<{
+    file: string;
+    message: string;
+    severity: 'high' | 'medium' | 'low';
+  }>;
+}
+
+function generatePRSummary(pr: GitPullRequest, statistics: AnalysisSummary['statistics'], suggestions: AnalysisSummary['suggestions']): string {
+  const highSeverityCount = suggestions.filter(s => s.severity === 'high').length;
+  const mediumSeverityCount = suggestions.filter(s => s.severity === 'medium').length;
+  
+  return `Review of PR #${pr.pullRequestId}: ${pr.title}\n` +
+    `Found ${highSeverityCount} high-severity and ${mediumSeverityCount} medium-severity issues.\n` +
+    `Changed ${statistics.filesChanged} files with +${statistics.additions}/-${statistics.deletions} lines.`;
 } 

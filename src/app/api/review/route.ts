@@ -10,19 +10,11 @@ export async function GET(request: Request) {
   }
 
   try {
-    // First, get the PR details to check ownership
+    // First, get the PR details
     const prDetails = await getLatestPullRequests(parseInt(prId));
     
     if (!prDetails) {
       return NextResponse.json({ error: 'Pull request not found' }, { status: 404 });
-    }
-
-    // If PR exists but doesn't belong to the authenticated user
-    if (!prDetails.isAuthenticatedUserPR) {
-      return NextResponse.json(
-        { error: 'You can only review your own pull requests' },
-        { status: 403 }
-      );
     }
 
     const review = await reviewPullRequest(parseInt(prId));
