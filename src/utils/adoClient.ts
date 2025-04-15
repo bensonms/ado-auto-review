@@ -47,9 +47,9 @@ export async function getAdoClient() {
   }
 }
 
-export async function getLatestPullRequests(count: number = 5): Promise<PullRequestDetails[]> {
+export async function getLatestPullRequests(): Promise<PullRequestDetails[]> {
   try {
-    console.debug('Fetching pull requests with count:', count);
+    console.debug('Fetching latest pull request');
 
     const { client, userId } = await getAdoClient();
     const gitApi = await client.getGitApi();
@@ -81,7 +81,7 @@ export async function getLatestPullRequests(count: number = 5): Promise<PullRequ
 
     // Now try to get pull requests with different statuses to debug
     const searchCriteria = {
-      status: PullRequestStatus.All,
+      status: PullRequestStatus.Active,
       repositoryId: repositoryId,
       creatorId: userId
     };
@@ -95,7 +95,7 @@ export async function getLatestPullRequests(count: number = 5): Promise<PullRequ
       repositoryId,
       searchCriteria,
       project,
-      count,
+      1,  // Always fetch just one PR
       0
     );
 
@@ -121,18 +121,18 @@ export async function getLatestPullRequests(count: number = 5): Promise<PullRequ
       }
     }
 
-    console.debug('Retrieved pull requests:', {
-      count: pullRequests.length,
-      requests: pullRequests.map(pr => ({
-        id: pr.pullRequestId,
-        title: pr.title,
-        status: pr.status,
-        createdBy: pr.createdBy?.displayName,
-        creatorId: pr.createdBy?.id,
-        sourceRef: pr.sourceRefName,
-        targetRef: pr.targetRefName
-      }))
-    });
+    // console.debug('Retrieved pull requests:', {
+    //   count: pullRequests.length,
+    //   requests: pullRequests.map(pr => ({
+    //     id: pr.pullRequestId,
+    //     title: pr.title,
+    //     status: pr.status,
+    //     createdBy: pr.createdBy?.displayName,
+    //     creatorId: pr.createdBy?.id,
+    //     sourceRef: pr.sourceRefName,
+    //     targetRef: pr.targetRefName
+    //   }))
+    // });
 
     return pullRequests
       .map((pr: GitPullRequest) => ({
