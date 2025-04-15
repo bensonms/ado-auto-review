@@ -3,6 +3,56 @@
 import * as azdev from 'azure-devops-node-api';
 import { PullRequestStatus, GitPullRequest, GitItem, GitCommitRef } from 'azure-devops-node-api/interfaces/GitInterfaces';
 
+// Configuration interfaces
+interface AdoConfig {
+  organization: string;
+  project: string;
+  repositoryId: string;
+  pat: string;
+}
+
+// Analysis configuration
+const ANALYSIS_CONFIG = {
+  COMPLEXITY: {
+    MAX_CYCLOMATIC: 10,
+    MAX_NESTING_LEVEL: 3,
+    MIN_BLOCK_SIZE: 5
+  },
+  BRANCH_PATTERNS: {
+    FEATURE: /^feature\//,
+    BUGFIX: /^bugfix\//,
+    HOTFIX: /^hotfix\//,
+    RELEASE: /^release\//
+  },
+  SEVERITY_SCORES: {
+    high: 3,
+    medium: 2,
+    low: 1
+  } as const
+};
+
+// Custom error classes
+class AdoConfigurationError extends Error {
+  constructor(message: string) {
+    super(`Configuration Error: ${message}`);
+    this.name = 'AdoConfigurationError';
+  }
+}
+
+class AdoApiError extends Error {
+  constructor(message: string, public readonly originalError?: unknown) {
+    super(`API Error: ${message}`);
+    this.name = 'AdoApiError';
+  }
+}
+
+// Utility function for config validation
+function validateConfig(key: string, value: string | undefined): asserts value is string {
+  if (!value) {
+    throw new AdoConfigurationError(`${key} is not configured`);
+  }
+}
+
 export interface PullRequestDetails {
   pullRequestId: number;
   title: string;
@@ -41,21 +91,29 @@ export interface CodeReviewResult {
 
 export async function getAdoClient() {
   try {
-    const orgUrl = `https://dev.azure.com/${process.env.ADO_ORGANIZATION}`;
-    const token = process.env.ADO_PAT;
+    // Validate configuration
+    validateConfig('Organization', process.env.ADO_ORGANIZATION);
+    validateConfig('PAT', process.env.ADO_PAT);
+    validateConfig('Project', process.env.ADO_PROJECT);
+    validateConfig('Repository ID', process.env.ADO_REPOSITORY_ID);
 
-    console.debug('ADO Configuration:', {
+    const config: AdoConfig = {
       organization: process.env.ADO_ORGANIZATION,
       project: process.env.ADO_PROJECT,
-      hasToken: !!token,
+      repositoryId: process.env.ADO_REPOSITORY_ID,
+      pat: process.env.ADO_PAT
+    };
+
+    const orgUrl = `https://dev.azure.com/${config.organization}`;
+
+    console.debug('ADO Configuration:', {
+      organization: config.organization,
+      project: config.project,
+      hasToken: !!config.pat,
       url: orgUrl
     });
 
-    if (!token) {
-      throw new Error('ADO Personal Access Token is not configured');
-    }
-
-    const authHandler = azdev.getPersonalAccessTokenHandler(token);
+    const authHandler = azdev.getPersonalAccessTokenHandler(config.pat);
     const client = new azdev.WebApi(orgUrl, authHandler);
     
     // Test the connection
@@ -65,10 +123,12 @@ export async function getAdoClient() {
       userId: connData.authenticatedUser?.id
     });
     
-    return { client, userId: connData.authenticatedUser?.id };
+    return { client, userId: connData.authenticatedUser?.id, config };
   } catch (error) {
-    console.error('Error initializing ADO client:', error);
-    throw error;
+    if (error instanceof AdoConfigurationError) {
+      throw error;
+    }
+    throw new AdoApiError('Error initializing ADO client', error);
   }
 }
 
@@ -76,22 +136,16 @@ export async function getLatestPullRequests(specificPrId?: number): Promise<Pull
   try {
     console.debug('Fetching pull request', { specificPrId });
 
-    const { client, userId } = await getAdoClient();
+    const { client, userId, config } = await getAdoClient();
     const gitApi = await client.getGitApi();
-    const project = process.env.ADO_PROJECT;
-    const repositoryId = '1b255d6e-1545-42ab-9e75-1fb3f0202dfa';
-
-    if (!project) {
-      throw new Error('ADO Project is not configured');
-    }
 
     if (!userId) {
-      throw new Error('Could not determine authenticated user ID');
+      throw new AdoConfigurationError('Could not determine authenticated user ID');
     }
 
     // Let's try to get the repository first to verify access
     try {
-      const repo = await gitApi.getRepository(repositoryId, project);
+      const repo = await gitApi.getRepository(config.repositoryId, config.project);
       console.debug('Successfully accessed repository:', {
         id: repo.id,
         name: repo.name,
@@ -100,8 +154,7 @@ export async function getLatestPullRequests(specificPrId?: number): Promise<Pull
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error accessing repository';
-      console.error('Error accessing repository:', error);
-      throw new Error(`Cannot access repository. Check permissions and repository ID. Details: ${errorMessage}`);
+      throw new AdoApiError(`Cannot access repository. Check permissions and repository ID. Details: ${errorMessage}`, error);
     }
 
     // Now try to get pull requests with different statuses to debug
@@ -109,7 +162,7 @@ export async function getLatestPullRequests(specificPrId?: number): Promise<Pull
       ? { pullRequestId: specificPrId }
       : {
           status: PullRequestStatus.Active,
-          repositoryId: repositoryId,
+          repositoryId: config.repositoryId,
           creatorId: userId
         };
 
@@ -119,9 +172,9 @@ export async function getLatestPullRequests(specificPrId?: number): Promise<Pull
     });
 
     const pullRequests = await gitApi.getPullRequests(
-      repositoryId,
+      config.repositoryId,
       searchCriteria,
-      project,
+      config.project,
       1,  // Always fetch just one PR
       0
     );
@@ -136,27 +189,23 @@ export async function getLatestPullRequests(specificPrId?: number): Promise<Pull
     const pr = pullRequests[0];
     return {
       pullRequestId: pr.pullRequestId || 0,
-      title: pr.title || 'Untitled Pull Request',
-      description: pr.description || '',
-      status: pr.status || PullRequestStatus.NotSet,
-      createdBy: pr.createdBy?.displayName || 'Unknown',
+      title: pr.title ?? 'Untitled Pull Request',
+      description: pr.description ?? '',
+      status: pr.status ?? PullRequestStatus.NotSet,
+      createdBy: pr.createdBy?.displayName ?? 'Unknown',
       creationDate: new Date(pr.creationDate || Date.now()),
-      repository: pr.repository?.name || 'Unknown',
-      sourceRef: pr.sourceRefName || '',
-      targetRef: pr.targetRefName || '',
-      url: pr._links?.web?.href || '',
+      repository: pr.repository?.name ?? 'Unknown',
+      sourceRef: pr.sourceRefName ?? '',
+      targetRef: pr.targetRefName ?? '',
+      url: pr._links?.web?.href ?? '',
       isAuthenticatedUserPR: pr.createdBy?.id === userId
     };
   } catch (error) {
     console.error('Error in getLatestPullRequests:', error);
-    if (error instanceof Error) {
-      console.error('Error details:', {
-        message: error.message,
-        stack: error.stack,
-        name: error.name
-      });
+    if (error instanceof AdoConfigurationError || error instanceof AdoApiError) {
+      throw error;
     }
-    throw error;
+    throw new AdoApiError('Failed to fetch pull requests', error);
   }
 }
 
@@ -396,7 +445,7 @@ function analyzeCodeComplexity(content: string) {
   const functionMatches = content.match(/function\s+\w+\s*\([^)]*\)\s*{([^}]*)}/g) || [];
   functionMatches.forEach((func: string) => {
     const complexity = (func.match(/if|while|for|&&|\|\||switch|catch/g) || []).length;
-    if (complexity > 10) {
+    if (complexity > ANALYSIS_CONFIG.COMPLEXITY.MAX_CYCLOMATIC) {
       issues.push({
         message: `High cyclomatic complexity (${complexity}). Consider breaking down the function.`,
         severity: 'high'
@@ -406,7 +455,7 @@ function analyzeCodeComplexity(content: string) {
 
   // Check for nested callbacks/promises
   const nestingLevel = (content.match(/\.then\(|\bcallback\(|\basync\s+/g) || []).length;
-  if (nestingLevel > 3) {
+  if (nestingLevel > ANALYSIS_CONFIG.COMPLEXITY.MAX_NESTING_LEVEL) {
     issues.push({
       message: 'Deep nesting of async operations detected. Consider using async/await or breaking down the chain.',
       severity: 'medium'
@@ -526,7 +575,7 @@ function analyzeDiff(oldContent: string, newContent: string) {
 
 function findMovedBlocks(oldLines: string[], newLines: string[]): number {
   let movedBlocks = 0;
-  const minBlockSize = 5;
+  const minBlockSize = ANALYSIS_CONFIG.COMPLEXITY.MIN_BLOCK_SIZE;
 
   for (let i = 0; i < oldLines.length - minBlockSize; i++) {
     const block = oldLines.slice(i, i + minBlockSize).join('\n');
@@ -553,8 +602,8 @@ function analyzeCommitMessages(commits: GitCommitRef[]): boolean {
 }
 
 function analyzeBranchNaming(branchName: string) {
-  const conventionalBranchPattern = /^(feature|bugfix|hotfix|release)\/[a-z0-9-]+$/;
-  const isValid = conventionalBranchPattern.test(branchName);
+  const patterns = Object.values(ANALYSIS_CONFIG.BRANCH_PATTERNS);
+  const isValid = patterns.some(pattern => pattern.test(branchName));
   return {
     isValid,
     message: isValid ? 'Branch naming follows conventions' : 'Branch name should follow pattern: type/description'
@@ -580,7 +629,7 @@ function analyzeDocumentation(changes: GitChangeEntry[]): { hasUpdates: boolean;
 }
 
 function severityScore(severity: 'high' | 'medium' | 'low'): number {
-  return { high: 3, medium: 2, low: 1 }[severity] || 0;
+  return ANALYSIS_CONFIG.SEVERITY_SCORES[severity];
 }
 
 interface AnalysisSummary {
